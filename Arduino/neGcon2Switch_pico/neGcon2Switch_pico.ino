@@ -4,13 +4,15 @@
 // raspberry PICO version
 // Copyright 2025 @V9938
 //
-//	25/06/07 V0.1		1st version
-//	25/06/07 V0.2		fix I/II/L Analog Value
+//	25/06/07 V0.1	1st version
+//	25/06/07 V0.2	fix I/II/L Analog Value
 //  25/06/10 V0.5   1st PICO version
 //  25/06/11 V0.6   Support NeoPixel
 //  25/06/11 V0.7   Support DX mode
 //  25/07/03 V1.0   Support Aircombat22 mode with SCPH1110
 //					Fixed bug Digtal mode setting
+//  25/07/03 V1.1   Support Controller HORI ANALOG SHINDOU PAD
+
 //
 //
 // This program requires same librarys
@@ -105,7 +107,7 @@ Adafruit_NeoPixel pixels(NUMPIXELS, NEOPIX, NEO_GRB + NEO_KHZ800);
 const char ctrlTypeUnknown[] PROGMEM = "Unknown";
 const char ctrlTypeDualShock[] PROGMEM = "Dual Shock";
 const char ctrlTypeDsWireless[] PROGMEM = "Dual Shock Wireless";
-const char ctrlTypeGuitHero[] PROGMEM = "Guitar Hero";
+const char ctrlTypeGuitHero[] PROGMEM = "3rd Party Controller";
 const char ctrlTypeOutOfBounds[] PROGMEM = "(Out of bounds)";
 
 const char* const controllerTypeStrings[PSCTRL_MAX + 1] PROGMEM = {
@@ -173,25 +175,25 @@ void loop1() {  //core 0
   switch (stickMode) {
       // neGconモード時の点灯パターン
     case MODE_STD:
-      pixels.setPixelColor(0, pixels.Color(b1_org/2 + bL_org/2, b2_org/2 + bL_org/2, lx_org));
+      pixels.setPixelColor(0, pixels.Color(b1_org / 2 + bL_org / 2, b2_org / 2 + bL_org / 2, lx_org));
       pixels.show();
       break;
 
       // neGconモード時の点灯パターン DXモード時のパターン
     case MODE_DX:
-      pixels.setPixelColor(0, pixels.Color(b2_org/2 + bL_org/2, lx_org, b1_org/2 + bL_org/2));
+      pixels.setPixelColor(0, pixels.Color(b2_org / 2 + bL_org / 2, lx_org, b1_org / 2 + bL_org / 2));
       pixels.show();
       break;
 
       // フライトコントローラ接続時の点灯パターン
     case MODE_AIRCON22:
-      pixels.setPixelColor(0, pixels.Color(ry_org/4, lx_org/8, ly_org/ 8 + 0x40));
+      pixels.setPixelColor(0, pixels.Color(ry_org / 4, lx_org / 8, ly_org / 8 + 0x40));
       pixels.show();
       break;
 
       // DualShock接続時の点灯パターン
     case MODE_ANALOG:
-      pixels.setPixelColor(0, pixels.Color(0, ly_org/4 + lx_org/2, ry_org/2 + rx_org/4));
+      pixels.setPixelColor(0, pixels.Color(0, ly_org / 4 + lx_org / 2, ry_org / 2 + rx_org / 4));
       pixels.show();
       break;
 
@@ -256,8 +258,9 @@ void loop() {
   byte l_x, l_y, l_b1, l_b2, l_bL;
   byte r_x, r_y;
   byte l_x_tmp;
-  PsxControllerType psxContType;
+  static PsxControllerType psxContType;
   PsxControllerProtocol psxStickMode;
+  static PsxControllerProtocol OldpsxStickMode;
 
   bool bSendData;
 
@@ -295,7 +298,7 @@ void loop() {
                      //     digitalWrite(PIN_ERRORLED, LOW);
 
       } else {
-        //Dual shock以降はこちらに来る。HORIのアナログ振動ジョイパッドは設定不可
+        //Dual shock以降はこちらに来る。HORIのアナログ振動ジョイパッドはDUALSHOCKに設定される
         psxContType = psx.getControllerType();
         Serial.print(F("Controller Type is: "));
         Serial.println(controllerTypeStrings[psxContType < PSCTRL_MAX ? static_cast<byte>(psxContType) : PSCTRL_MAX]);
@@ -317,6 +320,7 @@ void loop() {
                    //     	digitalWrite(PIN_ERRORLED, LOW);
 
       psxStickMode = psx.getProtocol();
+      OldpsxStickMode = psxStickMode;
       Serial.print(F("Controller Protocol is: "));
       Serial.println(controllerProtoStrings[psxStickMode < PSPROTO_MAX ? static_cast<byte>(psxStickMode) : PSPROTO_MAX]);
       haveController = true;
@@ -330,14 +334,15 @@ void loop() {
 
       Serial.println(F("Controller lost :("));
       haveController = false;
-      psxStickMode = psx.getProtocol();  //Stickモードを更新しておく
+      psxContType = PSCTRL_UNKNOWN;  //Stickモードを更新しておく
+      psxStickMode = PSPROTO_UNKNOWN;
+      OldpsxStickMode = PSPROTO_UNKNOWN;
       stickMode = MODE_LOST;
     } else {
       digitalWrite(PIN_GOODLED, LOW);  //Controller認識OK
       // PWM mode用LOOP回数処理
       if (loop_num >= PWM_LOOP) loop_num = 0;
-      loop_num++;
-
+      else loop_num++;
       psxStickMode = psx.getProtocol();  //現在のStickモードを取得
 
       // 動的にコントローラモードの変更されるもののみ列挙
@@ -345,6 +350,12 @@ void loop() {
       if (psxStickMode == PSPROTO_DIGITAL) stickMode = MODE_LOST;
       if (psxStickMode == PSPROTO_FLIGHTSTICK) stickMode = MODE_AIRCON22;
       if ((psxStickMode == PSPROTO_DUALSHOCK) || (psxStickMode == PSPROTO_DUALSHOCK2)) stickMode = MODE_ANALOG;
+      if ((psxContType == PSCTRL_GUITHERO) && (psxStickMode == PSPROTO_NEGCON)) stickMode = MODE_STD;  // HORI ANALOG SHINDO PAD NEGCON Mode
+      if (psxStickMode != OldpsxStickMode) {
+        Serial.print(F("Controller Protocol is: "));
+        Serial.println(controllerProtoStrings[psxStickMode < PSPROTO_MAX ? static_cast<byte>(psxStickMode) : PSPROTO_MAX]);
+      }
+      OldpsxStickMode = psxStickMode;
 
       // buttonデータを一端初期化
       t_joystickInputData.Button = 0;
