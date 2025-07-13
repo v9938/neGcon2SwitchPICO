@@ -17,6 +17,7 @@
 //                  Support save & restore neGcon mode
 //                  Change LED Pattern standard PSX Controller
 //                  Adjust I/II button value (x1.1)
+//  25/07/13 V1.3   Support maximum tilt setting(neGcon/Analog Stick).
 //
 //
 // This program requires same librarys
@@ -48,10 +49,14 @@
 #include <Adafruit_NeoPixel.h>
 #include <EEPROM.h>
 
+//#define SERIALVAL_OUT
+
 // EEPROMの設定
 #define EEPROMSIZE 256
 // EEPROMのアドレス配置
 #define EEPADR_NEGMODE 3
+#define EEPADR_NEG_NEGMAX 4
+#define EEPADR_ANALOG_STICKMAX 5
 
 // neGcon ハンドルアナログ値の補正
 // これ以上の補正が必要な場合は、設定→ボタン→こだわりのボタン設定→感度設定を弄ってください。
@@ -76,6 +81,7 @@
 #define MODE_NEGDIGTAL 6
 #define MODE_DIGTAL 7
 
+#define MODE_SETTING_NEG 98
 #define MODE_LOST 99
 
 //PWM modeの1LOOP回数 数字を細かくするとON-OFF間隔が短くなる(8ms x PWM_LOOP)
@@ -179,37 +185,117 @@ const Hat hatValue[0x10] = {
 };
 
 USB_JoystickReport_Input_t t_joystickInputData;
-
-byte lx_org, ly_org, b1_org, b2_org, bL_org;
-byte rx_org, ry_org;
+byte ledLx, ledLy, ledRx, ledRy, ledB1, ledB2, ledBL;
 byte stickMode;
-byte slx, sly, sb1, sb2, sbL, sBootSel = 0;
-byte srx, sry;
+byte lxMax;
+byte analogLxMax;
 
 
 // EEPROMのClear関数
 void eepromFormat() {
+  Serial.println(F("EEP Write!"));
   for (int i = 0; i < EEPROMSIZE; i++) {
     EEPROM.write(i, 0);
   }
-  EEPROM.write(0, 'C');
+  EEPROM.write(0, 'c');
   EEPROM.write(1, 'n');
-  EEPROM.write(2, 'F');
+  EEPROM.write(2, 'f');
   EEPROM.write(EEPADR_NEGMODE, MODE_STD);
+  EEPROM.write(EEPADR_NEG_NEGMAX, 255 / ((NEG_CALIB - 1) / 2 + 1));
+  EEPROM.write(EEPADR_ANALOG_STICKMAX, 255);
   EEPROM.commit();
 }
 
 // EEPROM領域の確認
 bool eepromCheck() {
-  if (EEPROM.read(0) != 'C') return false;
+  if (EEPROM.read(0) != 'c') return false;
   if (EEPROM.read(1) != 'n') return false;
-  if (EEPROM.read(2) != 'F') return false;
+  if (EEPROM.read(2) != 'f') return false;
   return true;
 }
+
+// neGconモードひねり値の最大値の復帰
+byte restoreNegDegMax() {
+  byte tmp;
+  tmp = EEPROM.read(EEPADR_NEG_NEGMAX);
+
+  // 有効値Check
+  if (tmp < 0x80) {
+    tmp = 255 / ((NEG_CALIB - 1) / 2 + 1);
+    Serial.println(F("EEP Write!"));
+    EEPROM.write(EEPADR_NEG_NEGMAX, tmp);
+    EEPROM.commit();
+  }
+
+  return tmp;
+}
+
+// アナログスティックモードひねり値の最大値の復帰
+byte restoreAnaDegMax() {
+  byte tmp;
+  tmp = EEPROM.read(EEPADR_ANALOG_STICKMAX);
+
+  // 有効値Check
+  if (tmp < 0x80) {
+    tmp = 255;
+
+    Serial.println(F("EEP Write!"));
+    EEPROM.write(EEPADR_ANALOG_STICKMAX, tmp);
+    EEPROM.commit();
+  }
+
+  return tmp;
+}
+
 // neGconモード設定の復帰
 byte restoreNegStickMode() {
-  return EEPROM.read(EEPADR_NEGMODE);
+  byte tmp;
+  tmp = EEPROM.read(EEPADR_NEGMODE);
+
+  // 有効値Check
+  switch (tmp) {
+    case MODE_STD:
+    case MODE_STDSWAP:
+    case MODE_DX:
+    case MODE_DXSWAP:
+      break;
+
+    default:
+      tmp = MODE_STD;
+      Serial.println(F("EEP Write!"));
+      EEPROM.write(EEPADR_NEGMODE, tmp);
+      EEPROM.commit();
+      break;
+  }
+
+  return tmp;
 }
+
+// 絶対値 計算関数
+int absoluteXY(byte lx) {
+  int lx_tmp;
+
+  if (lx < 0x80) lx_tmp = (int)(0xFF - lx);
+  else lx_tmp = (int)lx;
+  return lx_tmp;
+}
+
+// 補正値計算
+int adjustXY(byte lx, byte max) {
+  int lx_tmp;
+
+  if (lx > 0x80) {
+    lx_tmp = (int)((lx - 0x80)) * 0x7f / (max - 0x80);
+    if (lx_tmp > 0x7f) lx_tmp = 0x7f;
+    lx_tmp = 0x80 + lx_tmp;
+  } else {
+    lx_tmp = (int)((0x80 - lx)) * 0x7f / (max - 0x80);
+    if (lx_tmp > 0x80) lx_tmp = 0x80;
+    lx_tmp = 0x80 - lx_tmp;
+  }
+  return lx_tmp;
+}
+
 
 // CPU1では、NeoPixel LEDの点灯処理をさせる
 void setup1() {  //core 0
@@ -219,28 +305,31 @@ void setup1() {  //core 0
   delay(1000);
 }
 void loop1() {  //core 0
+  static byte heartbeat_num = 0;
+  static bool heartbeat_flag = true;
+
   switch (stickMode) {
       // neGconモード時の点灯パターン
     case MODE_STD:
-      pixels.setPixelColor(0, pixels.Color(b1_org / 2 + bL_org / 2, b2_org / 2 + bL_org / 2, lx_org));
+      pixels.setPixelColor(0, pixels.Color(ledB1 / 2 + ledBL / 2, ledB2 / 2 + ledBL / 2, ledLx));
       pixels.show();
       break;
 
       // neGconモード時の点灯パターン（I/II SWAPモード)
     case MODE_STDSWAP:
-      pixels.setPixelColor(0, pixels.Color(0x80 - sb1 + sb2, 0, lx_org));
+      pixels.setPixelColor(0, pixels.Color(0x80 - ledB1 + ledB2, 0, ledLx));
       pixels.show();
       break;
 
       // neGconモード時の点灯パターン DXモード時のパターン
     case MODE_DX:
-      pixels.setPixelColor(0, pixels.Color(b2_org / 2 + bL_org / 2, lx_org, b1_org / 2 + bL_org / 2));
+      pixels.setPixelColor(0, pixels.Color(ledB2 / 2 + ledBL / 2, ledLx, ledB1 / 2 + ledBL / 2));
       pixels.show();
       break;
 
       // neGconモード時の点灯パターン DXモード時のパターン（I/II SWAPモード)
     case MODE_DXSWAP:
-      pixels.setPixelColor(0, pixels.Color(0, 0x80 - sb1 + sb2, b1_org / 2 + bL_org / 2));
+      pixels.setPixelColor(0, pixels.Color(0, 0x80 - ledB1 + ledB2, ledLx / 2 + ledBL / 2));
       pixels.show();
       break;
 
@@ -252,13 +341,13 @@ void loop1() {  //core 0
 
       // フライトコントローラ接続時の点灯パターン
     case MODE_AIRCON22:
-      pixels.setPixelColor(0, pixels.Color(ry_org / 4, lx_org / 8, ly_org / 8 + 0x40));
+      pixels.setPixelColor(0, pixels.Color(ledRy / 4, ledLx / 8, ledRy / 8 + 0x40));
       pixels.show();
       break;
 
       // DualShock接続時の点灯パターン
     case MODE_ANALOG:
-      pixels.setPixelColor(0, pixels.Color(0, ly_org / 4 + lx_org / 2, ry_org / 2 + rx_org / 4));
+      pixels.setPixelColor(0, pixels.Color(0, ledRy / 4 + ledLx / 2, ledRy / 2 + ledRx / 4));
       pixels.show();
       break;
 
@@ -268,12 +357,25 @@ void loop1() {  //core 0
       pixels.show();
       break;
 
+    case MODE_SETTING_NEG:
+      pixels.setPixelColor(0, pixels.Color(0x0, 0x0, heartbeat_num));
+      pixels.show();
+      break;
+
+
       // 残念賞
     default:
       pixels.clear();
       pixels.show();
       break;
   }
+
+  //LEDの点滅処理数値計算
+  if (heartbeat_num == 0) heartbeat_flag = true;
+  else if (heartbeat_num == 255) heartbeat_flag = false;
+
+  if (heartbeat_flag) heartbeat_num++;
+  else heartbeat_num--;
 }
 
 void setup() {
@@ -313,6 +415,9 @@ void setup() {
   //	SPI.setSCK(PIN_PS2_CLK);
   //	SPI.setMOSI(PIN_PS2_CMD);
   //	SPI.setMISO(PIN_PS2_DAT);
+
+  lxMax = restoreNegDegMax();
+  analogLxMax = restoreAnaDegMax();
   stickMode = MODE_LOST;
   delay(300);
 
@@ -326,9 +431,19 @@ void setup() {
 
 void loop() {
   static int loop_num = 0;
+  static int sBootSel = 0;
+  static byte beforeStickMode;
+  static bool changeNegStickMode;
+  static byte slx, sly, sb1, sb2, sbL;
+  static byte srx, sry;
+
   byte l_x, l_y, l_b1, l_b2, l_bL;
+  byte lx_org, ly_org, b1_org, b2_org, bL_org;
+  byte rx_org, ry_org;
   byte r_x, r_y;
-  byte l_x_tmp;
+  int l_x_tmp, xy_tmp;
+
+
   static PsxControllerType psxContType;
   PsxControllerProtocol psxStickMode;
   static PsxControllerProtocol OldpsxStickMode;
@@ -339,26 +454,49 @@ void loop() {
   // 現状MODE選択に割り当てている
   if (BOOTSEL) {
     digitalWrite(PIN_ERRORLED, LOW);
-    if (sBootSel < 10) {
+    if (sBootSel < 3000) {
+      if (sBootSel == 0) changeNegStickMode = false;
       if (sBootSel == 9) {
-        if ((OldpsxStickMode == PSPROTO_NEGCON) || (OldpsxStickMode == PSPROTO_JOGCON)) {
-          if (stickMode == MODE_STD) stickMode = MODE_DX;
-          else if (stickMode == MODE_DX) stickMode = MODE_STDSWAP;
-          else if (stickMode == MODE_STDSWAP) stickMode = MODE_DXSWAP;
-          else if (stickMode == MODE_DXSWAP) stickMode = MODE_NEGDIGTAL;
-          else if (stickMode == MODE_NEGDIGTAL) stickMode = MODE_STD;
-          else stickMode == MODE_STD;
-
-          EEPROM.write(EEPADR_NEGMODE, stickMode);
-          EEPROM.commit();
-        }
-        Serial.print(F("Stick mode is: "));
+        changeNegStickMode = true;
+        Serial.print(F("Current Stick mode is: "));
         Serial.println(stickMode);
+      }
+      if (sBootSel == 2999) {
+        if ((OldpsxStickMode == PSPROTO_NEGCON) || (OldpsxStickMode == PSPROTO_JOGCON) || (OldpsxStickMode == PSPROTO_FLIGHTSTICK)) {
+          Serial.println(F("Set Config mode"));
+          changeNegStickMode = false;
+          beforeStickMode = stickMode;
+          stickMode = MODE_SETTING_NEG;
+        }
       }
       sBootSel++;
     }
   } else {
     digitalWrite(PIN_ERRORLED, HIGH);
+    if (changeNegStickMode) {
+
+      // ネジコンモード時のモード選択処理
+      if ((OldpsxStickMode == PSPROTO_NEGCON) || (OldpsxStickMode == PSPROTO_JOGCON)) {
+        if (stickMode == MODE_STD) stickMode = MODE_DX;
+        else if (stickMode == MODE_DX) stickMode = MODE_STDSWAP;
+        else if (stickMode == MODE_STDSWAP) stickMode = MODE_DXSWAP;
+        else if (stickMode == MODE_DXSWAP) stickMode = MODE_NEGDIGTAL;
+        else if (stickMode == MODE_NEGDIGTAL) stickMode = MODE_STD;
+        else stickMode == MODE_STD;
+
+        Serial.println(F("EEP Write!"));
+        EEPROM.write(EEPADR_NEGMODE, stickMode);
+        EEPROM.commit();
+      }
+
+      // 設定のキャンセル処理
+      if (stickMode == MODE_SETTING_NEG) stickMode = beforeStickMode;
+
+      Serial.print(F("Change Stick mode is: "));
+      Serial.println(stickMode);
+    }
+
+    changeNegStickMode = false;
     sBootSel = 0;
   }
 
@@ -468,12 +606,75 @@ void loop() {
             sly = l_y;
             srx = r_x;
             sry = r_y;
+
+#ifdef SERIALVAL_OUT
+            Serial.print(F("DEBUG : (ORG)LX: "));
+            Serial.print(l_x);
+            Serial.print(F(" LY: "));
+            Serial.print(l_y);
+            Serial.print(F(" RX: "));
+            Serial.print(r_x);
+            Serial.print(F(" RY: "));
+            Serial.print(r_y);
+#endif
+            l_x = (byte)adjustXY(l_x, analogLxMax);
+            l_y = (byte)adjustXY(l_y, analogLxMax);
+            r_x = (byte)adjustXY(r_x, analogLxMax);
+            r_y = (byte)adjustXY(r_y, analogLxMax);
+
+#ifdef SERIALVAL_OUT
+            Serial.print(F(" | (FIXED)LX: "));
+            Serial.print(l_x);
+            Serial.print(F(" LY: "));
+            Serial.print(l_y);
+            Serial.print(F(" RX: "));
+            Serial.print(r_x);
+            Serial.print(F(" RY: "));
+            Serial.println(r_y);
+#endif
+            ledLx = l_x;
+            ledLy = l_y;
+            ledRx = r_x;
+            ledRy = r_y;
+
             // 最終的な値をセット (ハンドル)
             t_joystickInputData.LX = (uint8_t)(l_x);
             t_joystickInputData.LY = (uint8_t)(l_y);
             t_joystickInputData.RX = (uint8_t)(r_x);
             t_joystickInputData.RY = (uint8_t)(r_y);
           }
+          //最大角、設定モード
+          if (stickMode == MODE_SETTING_NEG) {
+            if (psx.getButtonWord() & PSB_START) {
+              Serial.print(F("Analog lxMax before: "));
+              Serial.println(analogLxMax);
+              //センターからの相対値に変更
+              l_x_tmp = absoluteXY(lx_org);
+
+              xy_tmp = absoluteXY(ly_org);
+              if (xy_tmp > l_x_tmp) l_x_tmp = xy_tmp;
+
+              xy_tmp = absoluteXY(rx_org);
+              if (xy_tmp > l_x_tmp) l_x_tmp = xy_tmp;
+
+              xy_tmp = absoluteXY(ry_org);
+              if (xy_tmp > l_x_tmp) l_x_tmp = xy_tmp;
+
+              //センター値近辺の場合は初期値に設定
+              if (l_x_tmp < (0x80 + 10)) l_x_tmp = 255;
+
+              //設定値を保存
+              analogLxMax = (byte)l_x_tmp;
+              Serial.println(F("EEP Write!"));
+              EEPROM.write(EEPADR_ANALOG_STICKMAX, analogLxMax);
+              EEPROM.commit();
+
+              Serial.print(F("Analog lxMax after: "));
+              Serial.println(analogLxMax);
+              stickMode = beforeStickMode;
+            }
+          }
+
 
           // hat_switch（これは共通処理)
           t_joystickInputData.Hat = (uint8_t)(hatValue[(psx.getButtonWord() & 0x00f0) >> 4]);
@@ -584,7 +785,6 @@ void loop() {
               if (l_b2 > 0x10) t_joystickInputData.Button |= (uint16_t)(Button::ZL);
               // L buttonのデジタル化処理（アソビ領域判定）
               if (l_bL > 0x60) t_joystickInputData.Button |= (uint16_t)(Button::L);
-
             }
 
             if ((stickMode == MODE_STD) || (stickMode == MODE_STDSWAP)) {
@@ -600,7 +800,6 @@ void loop() {
               if (l_b1 / 3 > loop_num) t_joystickInputData.Button |= (uint16_t)(Button::ZR);
               // ZL buttonのデジタル化処理
               if (l_b2 / 3 > loop_num) t_joystickInputData.Button |= (uint16_t)(Button::ZL);
-
             }
             // 値の更新がある場合は更新処理を実施する
             if (l_x != slx || l_b1 != sb1 || l_b2 != sb2 || l_bL != sbL) {
@@ -609,16 +808,15 @@ void loop() {
               sb2 = l_b2;
               sbL = l_bL;
 
+#ifdef SERIALVAL_OUT
+              Serial.print(F("DEBUG : X(ORG): "));
+              Serial.print(l_x);
+              Serial.print(F(" LX(MAX): "));
+              Serial.print(lxMax);
+#endif
               // 各々のアナログ値がちょっと鈍い感じもあるので少しだけ補正する
-              if (l_x > 0x80) {
-                l_x_tmp = (l_x - 0x7f) * NEG_CALIB;
-                if (l_x_tmp > 0x7f) l_x_tmp = 0x7f;
-                l_x = 0x80 + l_x_tmp;
-              } else {
-                l_x_tmp = (0x80 - l_x) * NEG_CALIB;
-                if (l_x_tmp > 0x80) l_x_tmp = 0x80;
-                l_x = 0x80 - l_x_tmp;
-              }
+              l_x = (byte)adjustXY(l_x, lxMax);
+
               l_b1 = l_b1 * NEG_CALIB_B;
               if (l_b1 > 0x80) l_b1 = 0x80;
               l_b2 = l_b2 * NEG_CALIB_B;
@@ -626,11 +824,28 @@ void loop() {
               l_bL = l_bL * 1;
               if (l_bL > 0x7f) l_bL = 0x7f;
 
+#ifdef SERIALVAL_OUT
+              Serial.print(F(" X(FIX): "));
+              Serial.print(l_x);
+              Serial.print(F(" B1: "));
+              Serial.print(b1_org);
+              Serial.print(F(" B2: "));
+              Serial.print(b2_org);
+              Serial.print(F(" BL: "));
+              Serial.println(bL_org);
+#endif
+
+              //LEDへの値渡し
+              ledLx = l_x;
+              ledB1 = b1_org;
+              ledB2 = b2_org;
+              ledBL = bL_org;
+
               // 最終的な値をセット (ハンドル)
               if (stickMode == MODE_NEGDIGTAL) {
                 t_joystickInputData.LX = (uint8_t)(0x80);
                 t_joystickInputData.LY = (uint8_t)(0x80);
-              }else{
+              } else {
                 t_joystickInputData.LX = (uint8_t)(l_x);
                 t_joystickInputData.LY = (uint8_t)(0x80);
               }
@@ -639,12 +854,35 @@ void loop() {
               if ((stickMode == MODE_STD) || (stickMode == MODE_STDSWAP)) {
                 t_joystickInputData.RX = (uint8_t)(0x80);
                 t_joystickInputData.RY = (uint8_t)(0x80 - l_b1 + l_b2);
-              }else{
+              } else {
                 t_joystickInputData.RX = (uint8_t)(0x80);
                 t_joystickInputData.RY = (uint8_t)(0x80);
               }
             }
+            //最大角、設定モード
+            if (stickMode == MODE_SETTING_NEG) {
+              if (psx.getButtonWord() & PSB_START) {
+                Serial.print(F("neG lxMax before: "));
+                Serial.println(lxMax);
+                //センターからの相対値に変更
+                l_x_tmp = absoluteXY(lx_org);
+
+                //センター値近辺の場合は初期値に設定
+                if (l_x_tmp < (0x80 + 10)) l_x_tmp = 0xff / ((NEG_CALIB - 1) / 2 + 1);
+
+                //設定値を保存
+                lxMax = (byte)l_x_tmp;
+                Serial.println(F("EEP Write!"));
+                EEPROM.write(EEPADR_NEG_NEGMAX, lxMax);
+                EEPROM.commit();
+
+                Serial.print(F("neG lxMax after: "));
+                Serial.println(lxMax);
+                stickMode = beforeStickMode;
+              }
+            }
           }
+
           break;
 
         // Dual Shock/2のボタン配置
@@ -675,6 +913,11 @@ void loop() {
             sly = l_y;
             srx = r_x;
             sry = r_y;
+            ledLx = l_x;
+            ledLy = l_y;
+            ledRx = r_x;
+            ledRy = r_y;
+
             // 最終的な値をセット (ハンドル)
             t_joystickInputData.LX = (uint8_t)(l_x);
             t_joystickInputData.LY = (uint8_t)(l_y);
